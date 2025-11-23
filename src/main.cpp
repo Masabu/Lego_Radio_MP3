@@ -1,0 +1,208 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include "AudioFileSourceHTTPStream.h"
+#include "AudioFileSourceBuffer.h"
+#include "AudioGeneratorMP3.h"
+#include "AudioOutputI2S.h"
+
+// WiFi credentials
+const char* ssid = "SuperChevyChase2.4";
+const char* password = "LjdF2j7#m77t";
+
+// I2S pins for Arduino Nano ESP32 (ESP32-S3 based)
+// These pins are confirmed working!
+#define I2S_BCLK    9    // Bit Clock (BCK) D6 pin
+#define I2S_LRC     10   // Left/Right Clock (LRCK/WS) D7 pin
+#define I2S_DOUT    8    // Data Out (DIN) D5 pin
+
+// Rotary Encoder pins
+#define ENCODER_CLK  5   // CLK pin - D2 (GPIO5)
+#define ENCODER_DT   6   // DT pin - D3 (GPIO6)
+#define ENCODER_SW   7   // Switch/Button pin - D4 (GPIO7)
+
+// Encoder state variables
+volatile int encoderPos = 0;
+volatile int lastEncoded = 0;
+volatile bool buttonPressed = false;
+volatile unsigned long lastButtonPress = 0;
+const unsigned long debounceDelay = 200; // milliseconds
+
+// Volume control
+float currentVolume = 0.5;  // 0.0 to 1.0
+float savedVolume = 0.5;    // Store volume before mute
+bool isMuted = false;
+const float volumeStep = 0.05;
+
+// Audio objects
+AudioGeneratorMP3 *mp3;
+AudioFileSourceHTTPStream *file;
+AudioFileSourceBuffer *buff;
+AudioOutputI2S *out;
+
+// Interrupt Service Routine for encoder
+void IRAM_ATTR updateEncoder() {
+  int MSB = digitalRead(ENCODER_CLK);
+  int LSB = digitalRead(ENCODER_DT);
+  int encoded = (MSB << 1) | LSB;
+  int sum = (lastEncoded << 2) | encoded;
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+    encoderPos++;
+    Serial.printf("[ENCODER ISR] + CLK:%d DT:%d Pos:%d\n", MSB, LSB, encoderPos);
+  }
+  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+    encoderPos--;
+    Serial.printf("[ENCODER ISR] - CLK:%d DT:%d Pos:%d\n", MSB, LSB, encoderPos);
+  }
+  lastEncoded = encoded;
+}
+
+// Interrupt Service Routine for button
+void IRAM_ATTR buttonISR() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastButtonPress > debounceDelay) {
+    buttonPressed = true;
+    lastButtonPress = currentTime;
+  }
+}
+
+// BBC Radio Stream URLs - Pick one!
+// const char *URL = "http://stream.live.vc.bbcmedia.co.uk/bbc_world_service"; // BBC World Service (56kbps)
+const char *URL = "http://as-hls-ww-live.akamaized.net/pool_74208725/live/ww/bbc_radio_two/bbc_radio_two.isml/bbc_radio_two-audio%3d96000.norewind.m3u8"; // BBC Radio 2
+// const char *URL = "http://as-hls-ww-live.akamaized.net/pool_01505109/live/ww/bbc_radio_one/bbc_radio_one.isml/bbc_radio_one-audio%3d96000.norewind.m3u8"; // BBC Radio 1
+// const char *URL = "http://as-hls-ww-live.akamaized.net/pool_55057080/live/ww/bbc_radio_fourfm/bbc_radio_fourfm.isml/bbc_radio_fourfm-audio%3d96000.norewind.m3u8"; // BBC Radio 4
+// const char *URL = "http://as-hls-ww-live.akamaized.net/pool_81827798/live/ww/bbc_6music/bbc_6music.isml/bbc_6music-audio%3d96000.norewind.m3u8"; // BBC Radio 6 Music
+// const char *URL = "http://ice1.somafm.com/defcon-128-mp3"; // SomaFM DEF CON Radio
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  Serial.println("\n\n=================================");
+  Serial.println("I2S MP3 Player with Rotary Encoder");
+  Serial.println("=================================");
+  
+  // Setup encoder pins
+  Serial.println("Setting up Rotary Encoder...");
+  pinMode(ENCODER_CLK, INPUT_PULLUP);
+  pinMode(ENCODER_DT, INPUT_PULLUP);
+  pinMode(ENCODER_SW, INPUT_PULLUP);
+  
+  // Attach interrupts
+  attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), updateEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_DT), updateEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENCODER_SW), buttonISR, FALLING);
+  
+  // Initialize encoder state
+  lastEncoded = (digitalRead(ENCODER_CLK) << 1) | digitalRead(ENCODER_DT);
+  Serial.println("✓ Rotary Encoder ready");
+  
+  // Connect to WiFi
+  Serial.println("Connecting to WiFi...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi Connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n✗ WiFi Failed!");
+    while(1) delay(1000);
+  }
+  
+  // Setup I2S audio
+  Serial.println("\nInitializing I2S...");
+  Serial.printf("Pins: BCLK=%d, LRC=%d, DOUT=%d\n", I2S_BCLK, I2S_LRC, I2S_DOUT);
+  
+  out = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
+  out->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  out->SetGain(0.5);
+  Serial.println("✓ I2S ready");
+  
+  // Setup MP3 streaming
+  Serial.println("\nStarting MP3 stream...");
+  Serial.println(URL);
+  
+  file = new AudioFileSourceHTTPStream(URL);
+  if (!file->isOpen()) {
+    Serial.println("✗ Failed to open HTTP stream");
+    while(1) delay(1000);
+  }
+  Serial.println("✓ HTTP stream opened");
+  
+  buff = new AudioFileSourceBuffer(file, 8192);
+  mp3 = new AudioGeneratorMP3();
+  
+  Serial.println("Starting playback...");
+  if (mp3->begin(buff, out)) {
+    Serial.println("✓ MP3 Playing!");
+    Serial.println("Should hear audio now...");
+  } else {
+    Serial.println("✗ MP3 start failed");
+    if (mp3->isRunning()) {
+      Serial.println("MP3 says it's running though...");
+    }
+  }
+  Serial.println("=================================\n");
+}
+
+void loop() {
+  static unsigned long lastPrint = 0;
+  static int lastEncoderPos = 0;
+  
+  // CRITICAL: MP3 loop must be called frequently!
+  if (mp3->isRunning()) {
+    if (!mp3->loop()) {
+      mp3->stop();
+      Serial.println("Stream ended");
+    }
+  }
+  
+  // Debug: Print encoder pin states every second
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug > 1000) {
+    Serial.printf("[DEBUG] CLK:%d DT:%d SW:%d Pos:%d\n", digitalRead(ENCODER_CLK), digitalRead(ENCODER_DT), digitalRead(ENCODER_SW), encoderPos);
+    lastDebug = millis();
+  }
+  // Check for encoder changes (volume control)
+  if (encoderPos != lastEncoderPos) {
+    int change = encoderPos - lastEncoderPos;
+    Serial.printf("[ENCODER] Position changed: %d -> %d (change: %d)\n", lastEncoderPos, encoderPos, change);
+    lastEncoderPos = encoderPos;
+    // If muted, unmute when adjusting volume
+    if (isMuted) {
+      isMuted = false;
+      currentVolume = savedVolume;
+    }
+    // Adjust volume
+    currentVolume += change * volumeStep;
+    if (currentVolume < 0.0) currentVolume = 0.0;
+    if (currentVolume > 1.0) currentVolume = 1.0;
+    if (out) {
+      out->SetGain(currentVolume);
+      Serial.printf("Vol: %.0f%%\n", currentVolume * 100);
+    }
+  }
+  
+  // Check for button press (mute/unmute)
+  if (buttonPressed) {
+    buttonPressed = false;
+    if (!isMuted) {
+      savedVolume = currentVolume;
+      out->SetGain(0.0);
+      isMuted = true;
+      Serial.println("Mute");
+    } else {
+      currentVolume = savedVolume;
+      out->SetGain(currentVolume);
+      isMuted = false;
+      Serial.printf("Unmute %.0f%%\n", currentVolume * 100);
+    }
+  }
+}
