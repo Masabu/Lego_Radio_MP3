@@ -6,8 +6,8 @@
 #include "AudioOutputI2S.h"
 
 // WiFi credentials
-const char* ssid = "SuperChevyChase2.4";
-const char* password = "LjdF2j7#m77t";
+const char* ssid = "";
+const char* password = "";
 
 // I2S pins for Arduino Nano ESP32 (ESP32-S3 based)
 // These pins are confirmed working!
